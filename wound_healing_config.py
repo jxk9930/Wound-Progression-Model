@@ -1,4 +1,9 @@
-"""Configuration and defaults for the healing-only wound progression model."""
+"""Configuration and defaults for the healing-only wound progression model.
+
+Revision: added Vermolen boundary-law parameters (vermolen_B, vermolen_Q,
+growth_factor_sigma) so that curvature-dependent boundary smoothing is
+applied on top of the hybrid crawl / purse-string inward speed.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,16 +26,25 @@ class HealingParams:
 
     dt: float = 0.20  # days per update
 
-    # Legacy baseline (kept for compatibility); hybrid law below drives inward motion.
-    inward_speed_px_per_day: float = 0.22
-    outward_speed_px_per_day: float = 0.46
+    # ── Vermolen boundary law: v = (A + B·κ) · H(c - Q) ──────────────
+    # A is computed dynamically by _hybrid_inward_speed() each step.
+    # B controls how strongly curvature affects local boundary speed.
+    # Q is the growth-factor threshold for the Heaviside gate.
+    vermolen_B: float = 0.25          # curvature gain (px²/day)
+    vermolen_Q: float = 0.15          # growth-factor threshold [0-1]
+    growth_factor_sigma: float = 4.0  # spatial smoothing of GF field
+    vermolen_clamp: float = 0.8       # max |v| to prevent instability
 
-    # Batch 1: hybrid speed law (large wound -> crawling, small wound -> purse-string)
-    crawl_speed_px_per_day: float = 0.30
-    purse_string_speed_px_per_day: float = 0.18
-    purse_curvature_gain: float = 0.15
+    # ── Hybrid inward speed (feeds into Vermolen A) ──────────────────
+    crawl_speed_px_per_day: float = 0.75
+    purse_string_speed_px_per_day: float = 0.45
+    purse_curvature_gain: float = 0.35
     crawl_large_radius_ratio: float = 0.70
     purse_small_radius_ratio: float = 0.25
+
+    # Legacy baseline (kept for outward band speed)
+    inward_speed_px_per_day: float = 0.22
+    outward_speed_px_per_day: float = 0.90
 
     max_outward_band_ratio: float = 0.28
     min_outward_band_px: int = 4
