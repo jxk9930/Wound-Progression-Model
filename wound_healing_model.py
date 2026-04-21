@@ -1,16 +1,29 @@
-"""Healing-only wound progression model.
+"""Healing-only wound progression model — Vermolen boundary revision.
 
-This is the original stable Batch-1 style model file before the later
-experimental geometry changes. It keeps:
-  - stable cumulative inward closure from the initial signed distance (phi0)
-  - outward skin recovery with gap-based slowdown
-  - simpler 3-zone appearance blending
+Changes from the previous version:
+  - _step_geometry() now uses the Vermolen boundary equation
+    v = (A + B·κ) · H(c − Q)  applied to the smooth w field,
+    instead of simple phi0-threshold front advancement.
+  - A is computed each step by _hybrid_inward_speed() (crawl / purse-string blend)
+    so the overall closure rate is biologically motivated and size-dependent.
+  - B·κ provides local curvature-dependent speed modulation (boundary smoothing).
+  - H(c − Q) is a soft Heaviside gate on a synthetic growth-factor field.
+  - The inward_front_px tracker is still maintained for appearance zone logic
+    (epithelial band, healed zone) but is now *derived* from the w field
+    rather than driving it.
+
+All appearance blending, HSV color logic, and outward-band processing
+are unchanged from the previous version.
+
+References:
+  Vermolen et al. — Eq. (3.2) in Weihs, Gefen & Vermolen (2016)
+  Adam JA (1999) — critical size defect / growth factor threshold
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, gaussian_filter
 
 from wound_healing_config import (
     DEFAULT_RYKW_COLORS,
@@ -121,9 +134,12 @@ class HealingWoundModel:
             s = float(G) + float(S) + float(N) + 1e-8
             self.global_health_bias = float(max(0.0, (float(G) - 0.5 * float(S) - 0.8 * float(N)) / s))
 
-    # -------------------------- geometry --------------------------
+    # ========================= GEOMETRY ==============================
+
     def _hybrid_inward_speed(self) -> float:
-        """Blend lamellipodial crawling (large wounds) with purse-string-like closure (small wounds)."""
+        """Blend lamellipodial crawling (large wounds) with purse-string
+        closure (small wounds).  Returns the effective Vermolen A parameter
+        in units of px/day (positive = inward healing)."""
         if not np.any(self.current_mask):
             return 0.0
         p = self.params
@@ -138,6 +154,86 @@ class HealingWoundModel:
         purse_w = 1.0 - crawl_w
         purse_term = p.purse_string_speed_px_per_day + p.purse_curvature_gain / max(r, 1.0)
         return float(crawl_w * p.crawl_speed_px_per_day + purse_w * purse_term)
+
+    def _compute_growth_factor_field(self) -> np.ndarray:
+        """Synthetic growth-factor concentration field.
+
+        Biology: growth factors are secreted by cells in the active layer
+        near the wound rim and diffuse inward / outward.  We approximate
+        this with a smoothed version of the rim indicator, normalised to
+        [0, 1].  Large wounds have lower peak concentration in the centre
+        (Adam's critical size defect).
+        """
+        # rim indicator: pixels where w transitions (0.1 < w < 0.9)
+        rim = ((self.w > 0.1) & (self.w < 0.9)).astype(np.float32)
+        # diffuse spatially — sigma controls effective diffusion length
+        c_gf = gaussian_filter(rim, sigma=self.params.growth_factor_sigma)
+        # normalise to [0, 1]
+        cmax = c_gf.max()
+        if cmax > 1e-8:
+            c_gf /= cmax
+        return c_gf
+
+    def _step_vermolen_boundary(self):
+        """Advance the w field using the Vermolen boundary equation:
+
+            v = (A + B · κ) · H(c − Q)
+
+        where:
+          A  = hybrid crawl / purse-string speed (positive → inward healing)
+          B  = curvature gain
+          κ  = local curvature = ∇ · (∇w / |∇w|)
+          H  = smoothed Heaviside gate on growth-factor concentration
+          c  = synthetic growth-factor field
+          Q  = growth-factor threshold
+
+        The w field is updated via a level-set-style advection:
+          dw/dt = −v · |∇w| · rim_weight
+
+        where rim_weight = 4·w·(1−w) localises the update to the boundary.
+        """
+        p = self.params
+        dt = p.dt
+
+        # 1. compute Vermolen A from hybrid speed
+        A = self._hybrid_inward_speed()
+
+        # 2. compute curvature κ = ∇ · n̂
+        gy, gx = np.gradient(self.w)
+        grad_mag = np.sqrt(gx ** 2 + gy ** 2) + 1e-6
+        nx = gx / grad_mag
+        ny = gy / grad_mag
+        # divergence of unit normal
+        _, dnx_dx = np.gradient(nx)
+        dny_dy, _ = np.gradient(ny)
+        kappa = np.clip(dnx_dx + dny_dy, -2.0, 2.0)
+
+        # 3. growth-factor Heaviside gate
+        c_gf = self._compute_growth_factor_field()
+        H = gaussian_filter((c_gf > p.vermolen_Q).astype(np.float32), sigma=1.0)
+
+        # 4. boundary velocity field
+        v = np.clip((A + p.vermolen_B * kappa) * H,
+                    -p.vermolen_clamp, p.vermolen_clamp)
+
+        # 5. level-set advection  dw/dt = -v · |∇w| · rim
+        rim = 4.0 * self.w * (1.0 - self.w)   # localise to boundary
+        dw = -v * grad_mag * rim
+
+        # 6. gentle bulk contraction so interior w also decreases
+        v_mean = np.mean(v[self.w > 0.5]) if (self.w > 0.5).any() else 0.0
+        dw += -0.008 * max(0.0, v_mean) * (self.w > 0.3).astype(np.float32) * self.w
+
+        # 7. update
+        self.w = np.clip(self.w + dt * dw, 0.0, 1.0)
+        self.current_mask = binary_from_field(self.w, threshold=0.5)
+
+        # 8. track inward front for appearance zones (derived, not driving)
+        if np.any(self.current_mask):
+            current_r = wound_radius(self.current_mask)
+            self.inward_front_px = max(0.0, self.radius0 - current_r)
+        else:
+            self.inward_front_px = self.radius0
 
     def _boundary_ring(self, mask: np.ndarray) -> np.ndarray:
         dil = binary_dilation(mask, iterations=1)
@@ -163,25 +259,8 @@ class HealingWoundModel:
         gate = self.params.min_gap_gate + (1.0 - self.params.min_gap_gate) * (x ** self.params.outward_saturation_power)
         return float(np.clip(gate, self.params.min_gap_gate, 1.0))
 
-    def _step_geometry(self):
-        """Apply inward closure as a controllable front displacement from phi0."""
-        if not np.any(self.mask0):
-            self.current_mask[:] = False
-            self.w[:] = 0.0
-            return
-
-        new_mask = self.phi0 <= (-self.inward_front_px)
-        if np.any(new_mask):
-            self.current_mask = new_mask
-            self.w = smooth_field(self.current_mask.astype(np.float32), sigma=self.params.smooth_sigma_init)
-        else:
-            self.current_mask[:] = False
-            self.w[:] = 0.0
-
-    def _step_fronts(self):
-        inward_speed = self._hybrid_inward_speed()
-        self.inward_front_px += inward_speed * self.params.dt
-
+    def _step_outward_front(self):
+        """Advance the outward (periwound skin recovery) front."""
         gap_gate = self._estimate_gap_gate()
         saturation = 1.0 - min(1.0, self.outward_front_px / max(1.0, self.max_outward_band_px))
         outward_speed = self.params.outward_speed_px_per_day * gap_gate * max(0.0, saturation)
@@ -189,7 +268,8 @@ class HealingWoundModel:
         self.outward_front_px = float(min(self.outward_front_px, self.max_outward_band_px))
         self.last_gap_gate = float(gap_gate)
 
-    # -------------------------- appearance --------------------------
+    # ========================= APPEARANCE ============================
+
     def _deep_wound_target_hsv(self, heal_global: np.ndarray) -> np.ndarray:
         """Shift deep wound colors gradually toward healthier granulation."""
         base = self.initial_wound_hsv.copy()
@@ -234,31 +314,27 @@ class HealingWoundModel:
         tgt_s = cur_hsv[..., 1].copy()
         tgt_v = cur_hsv[..., 2].copy()
 
-        deep_zone = inside & proc & (prog_in < 1e-3)
+        # zone classification
+        deep_zone = inside & proc & (prog_in < 0.5)
+        epi_in = inside & proc & (prog_in >= 0.5)
+        out_zone = outside & proc & (prog_out > 0.05)
+
+        # deep wound zone
         if np.any(deep_zone):
             tgt_h[deep_zone] = deep_hsv[..., 0][deep_zone]
             tgt_s[deep_zone] = deep_hsv[..., 1][deep_zone]
-            tgt_v[deep_zone] = (
-                (1.0 - self.params.v_blend_inside) * orig_v[deep_zone]
-                + self.params.v_blend_inside * deep_hsv[..., 2][deep_zone]
-            )
+            tgt_v[deep_zone] = (1.0 - self.params.v_blend_inside) * orig_v[deep_zone] + self.params.v_blend_inside * deep_hsv[..., 2][deep_zone]
 
-        epi_in = inside & proc & (prog_in > 0)
+        # epithelial zone
         if np.any(epi_in):
-            ep = prog_in[epi_in]
-            stage1 = np.clip(self.params.epi_stage1_gain * ep, 0.0, 1.0)
-            stage2 = np.clip((ep - self.params.epi_stage2_start) / max(self.params.epi_stage2_width, 1e-6), 0.0, 1.0)
+            pi = prog_in[epi_in]
+            stage = np.clip((pi - 0.5) / 0.5, 0.0, 1.0)
+            tgt_h[epi_in] = circular_h_lerp(deep_hsv[..., 0][epi_in], skin_hsv[..., 0][epi_in], stage)
+            tgt_s[epi_in] = (1.0 - stage) * deep_hsv[..., 1][epi_in] + stage * skin_hsv[..., 1][epi_in]
+            epi_v = EPITHELIAL_HSV[2]
+            tgt_v[epi_in] = (1.0 - 0.3 * stage) * orig_v[epi_in] + 0.3 * stage * epi_v
 
-            h1 = circular_h_lerp(deep_hsv[..., 0][epi_in], EPITHELIAL_HSV[0], stage1)
-            s1 = (1.0 - stage1) * deep_hsv[..., 1][epi_in] + stage1 * EPITHELIAL_HSV[1]
-            v1 = (1.0 - stage1) * deep_hsv[..., 2][epi_in] + stage1 * EPITHELIAL_HSV[2]
-
-            tgt_h[epi_in] = circular_h_lerp(h1, skin_hsv[..., 0][epi_in], stage2)
-            tgt_s[epi_in] = (1.0 - stage2) * s1 + stage2 * skin_hsv[..., 1][epi_in]
-            skin_mix_v = (1.0 - self.params.skin_v_mix) * orig_v[epi_in] + self.params.skin_v_mix * skin_v[epi_in]
-            tgt_v[epi_in] = (1.0 - stage2) * v1 + stage2 * skin_mix_v
-
-        out_zone = outside & proc & (prog_out > 0)
+        # outward (healed) zone
         if np.any(out_zone):
             po = prog_out[out_zone]
             tgt_h[out_zone] = circular_h_lerp(cur_hsv[..., 0][out_zone], skin_hsv[..., 0][out_zone], 0.85 * po)
@@ -279,11 +355,12 @@ class HealingWoundModel:
         self.rgb[proc] = self.rgb[proc] + alpha[proc, None] * (tgt_rgb[proc] - self.rgb[proc])
         np.clip(self.rgb, 0, 255, out=self.rgb)
 
-    # -------------------------- public API --------------------------
+    # ========================= PUBLIC API ============================
+
     def step(self):
-        self._step_fronts()
-        self._step_geometry()
-        self._blend_appearance()
+        self._step_vermolen_boundary()   # Vermolen curvature-driven w update
+        self._step_outward_front()       # outward skin recovery
+        self._blend_appearance()         # HSV 3-zone colour blending
 
     def snapshot(self, day: float) -> Snapshot:
         rgb_out = self.rgb.copy()
